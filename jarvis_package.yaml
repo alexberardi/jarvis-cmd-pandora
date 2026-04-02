@@ -1,0 +1,36 @@
+name: "pandora"
+display_name: "Pandora Radio"
+description: "Stream Pandora radio stations with voice control. Play stations, skip tracks, thumbs up/down, and create new stations."
+version: "1.0.0"
+min_jarvis_version: "0.9.0"
+license: "MIT"
+author:
+  github: "alexberardi"
+categories: ["media", "music"]
+platforms: ["darwin", "linux"]
+keywords: ["pandora", "radio", "music", "streaming", "stations", "thumbs up", "skip"]
+
+components:
+  - type: command
+    name: pandora
+    path: commands/pandora/command.py
+
+packages:
+  - name: pydora
+    version: ">=2.1.0"
+
+secrets:
+  - key: PANDORA_EMAIL
+    scope: user
+    value_type: string
+    description: "Pandora account email address"
+    is_sensitive: false
+    required: true
+    friendly_name: "Pandora Email"
+  - key: PANDORA_PASSWORD
+    scope: user
+    value_type: string
+    description: "Pandora account password"
+    is_sensitive: true
+    required: true
+    friendly_name: "Pandora Password"
