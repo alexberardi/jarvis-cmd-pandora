@@ -76,6 +76,30 @@ def _pulseaudio_accessible() -> bool:
         return False
 
 
+def _pulseaudio_has_real_output() -> bool:
+    """Check if PA's default sink is a real audio output (not auto_null/Dummy).
+
+    WirePlumber inserts a placeholder ``auto_null`` (a.k.a. "Dummy Output")
+    sink when no real ALSA cards are detected. Routing a player to that
+    sink looks fine to the player but produces no audible sound. We treat
+    that case the same as "PulseAudio unreachable" — fall back to ALSA
+    directly so the local speaker hears something.
+    """
+    if shutil.which("pactl") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+        if result.returncode != 0:
+            return False
+        sink = result.stdout.strip().lower()
+        return bool(sink) and "auto_null" not in sink and "dummy" not in sink
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
 # Minimum number of seconds a player must stay alive before we treat its exit
 # as "track ended naturally" rather than "playback failed immediately".
 # Below this threshold we stop the auto-advance loop to prevent runaway
@@ -236,40 +260,52 @@ class PandoraService:
         """
         self._kill_player()
 
+        # Decide routing: BT sink wins; else ALSA-direct if PA has no real
+        # output; else PA default sink.
+        bt_sink: str | None = None
+        try:
+            from jarvis_command_sdk import BluetoothAudio
+            bt_sink = BluetoothAudio.target_sink()
+        except ImportError:
+            pass
+
+        # Use ALSA-direct when there's no BT and either (a) PA is
+        # unreachable or (b) PA's default sink is the placeholder
+        # auto_null/Dummy that WirePlumber inserts when no cards are
+        # detected. Without (b), the player happily streams into the
+        # null sink and produces silence.
+        use_alsa_direct = bt_sink is None and (
+            not _pulseaudio_accessible() or not _pulseaudio_has_real_output()
+        )
+
         cmd: list[str] = []
         if self._player_bin == "mpv":
-            cmd = ["mpv", "--no-video", "--really-quiet", audio_url]
+            if use_alsa_direct:
+                cmd = ["mpv", "--no-video", "--really-quiet",
+                       "--ao=alsa", "--audio-device=alsa/output", audio_url]
+            else:
+                cmd = ["mpv", "--no-video", "--really-quiet", audio_url]
         elif self._player_bin == "ffplay":
             # -loglevel error keeps fatal errors visible while staying quiet
             cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", audio_url]
         elif self._player_bin in ("vlc", "cvlc"):
-            cmd = ["cvlc", "--play-and-exit", "--no-video", "-q", audio_url]
+            if use_alsa_direct:
+                cmd = ["cvlc", "--play-and-exit", "--no-video", "-q",
+                       "--aout=alsa", "--alsa-audio-device=output", audio_url]
+            else:
+                cmd = ["cvlc", "--play-and-exit", "--no-video", "-q", audio_url]
 
-        # Route to Bluetooth speaker if available, otherwise local speaker
-        try:
-            from jarvis_command_sdk import BluetoothAudio
-            env = BluetoothAudio.playback_env()
-        except ImportError:
-            env = None
-
-        # If PulseAudio isn't reachable from this process (e.g. jarvis-node
-        # running as root while PulseAudio is per-user), force SDL/ALSA-backed
-        # players to bypass PulseAudio entirely.
-        #
-        # Two env vars are needed together:
-        #   SDL_AUDIODRIVER=alsa — tells SDL to use ALSA, not PulseAudio
-        #   AUDIODEV=output     — tells ALSA to open the named "output" PCM
-        #                          (defined in jarvis-node-setup's asound.conf
-        #                          as softvol → HifiBerry / card 0)
-        # Setting only SDL_AUDIODRIVER is NOT enough — SDL still opens ALSA's
-        # "default" device, which goes through the pulse plugin and fails
-        # with "Couldn't open audio device: Connection refused".
-        # User-set env vars take precedence (setdefault), so non-Pi systems
-        # can override.
-        if not _pulseaudio_accessible():
-            env = dict(env) if env else dict(os.environ)
-            env.setdefault("SDL_AUDIODRIVER", "alsa")
-            env.setdefault("AUDIODEV", "output")
+        env = dict(os.environ)
+        if bt_sink:
+            env["PULSE_SINK"] = bt_sink
+        elif use_alsa_direct:
+            # SDL-backed players (ffplay) need both env vars to bypass PA:
+            #   SDL_AUDIODRIVER=alsa  → use ALSA, not pulse
+            #   AUDIODEV=output       → open the "output" PCM alias from
+            #                            jarvis-node-setup's asound.conf
+            #                            (softvol → seeed2micvoicec card)
+            env["SDL_AUDIODRIVER"] = "alsa"
+            env["AUDIODEV"] = "output"
 
         self._player_process = subprocess.Popen(
             cmd,
