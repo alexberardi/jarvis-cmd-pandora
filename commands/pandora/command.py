@@ -41,22 +41,28 @@ from jarvis_command_sdk import (
 logger = JarvisLogger(service="jarvis-node")
 
 
+# Module-level singleton — survives across tool calls within the same process.
+# Without this, each MQTT tool_call re-instantiates PandoraCommand and the
+# authenticated session is lost, causing repeated logins and rate limiting.
+_cached_service: Any = None
+
+
 class PandoraCommand(IJarvisCommand):
     """Stream Pandora radio stations with voice control."""
 
     def __init__(self) -> None:
         self._storage = JarvisStorage("pandora")
-        self._service: Any = None
 
     def _get_service(self) -> Any:
-        """Get or create an authenticated PandoraService."""
-        if self._service is not None and self._service.is_logged_in:
-            return self._service
+        """Get or create an authenticated PandoraService (cached at module level)."""
+        global _cached_service
+        if _cached_service is not None and _cached_service.is_logged_in:
+            return _cached_service
 
         from pandora_shared.pandora_service import PandoraService
 
-        email = self._storage.get_secret("PANDORA_EMAIL", scope="user")
-        password = self._storage.get_secret("PANDORA_PASSWORD", scope="user")
+        email = self._storage.get_secret("PANDORA_EMAIL", scope="integration")
+        password = self._storage.get_secret("PANDORA_PASSWORD", scope="integration")
         if not email or not password:
             raise ValueError(
                 "Pandora credentials not configured. "
@@ -65,7 +71,7 @@ class PandoraCommand(IJarvisCommand):
 
         service = PandoraService()
         service.login(email, password)
-        self._service = service
+        _cached_service = service
         return service
 
     # -- Metadata --
@@ -116,7 +122,6 @@ class PandoraCommand(IJarvisCommand):
                     "thumbs_up",
                     "thumbs_down",
                     "stations",
-                    "create_station",
                     "now_playing",
                 ],
                 description="The action to perform",
@@ -125,7 +130,11 @@ class PandoraCommand(IJarvisCommand):
                 "query",
                 "string",
                 required=False,
-                description="Station name to play, or artist/song to create a station from",
+                description=(
+                    "What to play. Matches an existing station by name, or "
+                    "creates and plays a new station from an artist/song/genre "
+                    "if no match is found."
+                ),
             ),
         ]
 
@@ -168,21 +177,23 @@ class PandoraCommand(IJarvisCommand):
             "If user says 'next' or 'next song', use action='skip'",
             "If user says 'what's playing' or 'what song is this', use action='now_playing'",
             "If user says 'play pandora' without a station name, use action='play' with no query",
-            "If user says 'play my [X] station', use action='play' with query='[X]'",
-            "If user says 'make a station for [X]' or 'create [X] station', use action='create_station'",
+            "If user says 'play [X]', 'play my [X] station', 'play [X] radio', or "
+            "'put on [X]', use action='play' with query='[X]'. The query may be a "
+            "station name, an artist, a song, or a genre — play handles all of them.",
         ]
 
     @property
     def critical_rules(self) -> list[str]:
         return [
             "Use 'thumbs_down' not 'skip' when user expresses dislike for a song.",
-            "Use 'play' not 'create_station' when referring to an existing station.",
+            "Always use action='play' when the user wants to hear something — never "
+            "ask the user to choose between an existing station and a new one.",
         ]
 
     # -- Pre-routing --
 
     def pre_route(self, voice_command: str) -> PreRouteResult | None:
-        text = voice_command.lower().strip()
+        text = voice_command.lower().strip().rstrip(".!?")
 
         simple_map: dict[str, dict[str, str]] = {
             "skip": {"action": "skip"},
@@ -207,9 +218,23 @@ class PandoraCommand(IJarvisCommand):
         if text in simple_map:
             return PreRouteResult(arguments=simple_map[text])
 
-        m = re.match(r"^play (?:my )?(.+?) station$", text)
+        # "play X", "play my X", "play X station", "play X radio",
+        # "play X on Pandora", "put on X", "listen to X", "start X" — extract X.
+        # Trailing "station|radio" and "on pandora" are phrasing, not part of the name.
+        m = re.match(
+            r"^(?:play|put on|listen to|start)\s+"
+            r"(?:my\s+)?(?:pandora\s+)?"
+            r"(.+?)"
+            r"(?:\s+(?:station|radio))?"
+            r"(?:\s+on\s+pandora)?$",
+            text,
+        )
         if m:
-            return PreRouteResult(arguments={"action": "play", "query": m.group(1)})
+            query = m.group(1).strip()
+            # Filter out generic words that don't identify a station.
+            if query in ("", "pandora", "music", "radio", "something"):
+                return PreRouteResult(arguments={"action": "play"})
+            return PreRouteResult(arguments={"action": "play", "query": query})
 
         return None
 
@@ -224,10 +249,11 @@ class PandoraCommand(IJarvisCommand):
                 "",
                 voice_command,
                 flags=re.IGNORECASE,
-            ).strip()
+            ).strip().rstrip(".!?")
+            # Strip trailing "station" or "radio" — those are phrasing, not part of the name
+            stripped = re.sub(r"\s+(?:station|radio)$", "", stripped, flags=re.IGNORECASE)
             # Only set query if we extracted something meaningful
             if stripped and stripped.lower() not in ("pandora", "radio", "music", ""):
-                stripped = re.sub(r"\s+station$", "", stripped, flags=re.IGNORECASE)
                 args["query"] = stripped
         return args
 
@@ -245,6 +271,14 @@ class PandoraCommand(IJarvisCommand):
                 expected_parameters={"action": "play", "query": "jazz"},
             ),
             CommandExample(
+                voice_command="Play summer hits of the 90s radio",
+                expected_parameters={"action": "play", "query": "summer hits of the 90s"},
+            ),
+            CommandExample(
+                voice_command="Put on some Radiohead",
+                expected_parameters={"action": "play", "query": "Radiohead"},
+            ),
+            CommandExample(
                 voice_command="Skip this song",
                 expected_parameters={"action": "skip"},
             ),
@@ -259,10 +293,6 @@ class PandoraCommand(IJarvisCommand):
             CommandExample(
                 voice_command="What stations do I have on Pandora",
                 expected_parameters={"action": "stations"},
-            ),
-            CommandExample(
-                voice_command="Create a Radiohead station",
-                expected_parameters={"action": "create_station", "query": "Radiohead"},
             ),
             CommandExample(
                 voice_command="What's playing right now",
@@ -283,6 +313,12 @@ class PandoraCommand(IJarvisCommand):
             ("Put on my 90s station", {"action": "play", "query": "90s"}),
             ("Play my classical station", {"action": "play", "query": "classical"}),
             ("Play some country on Pandora", {"action": "play", "query": "country"}),
+            ("Play summer hits of the 90s radio", {"action": "play", "query": "summer hits of the 90s"}),
+            ("Play the Beatles radio", {"action": "play", "query": "the Beatles"}),
+            ("Put on Tom Petty", {"action": "play", "query": "Tom Petty"}),
+            ("Play some Taylor Swift", {"action": "play", "query": "Taylor Swift"}),
+            ("Listen to Radiohead", {"action": "play", "query": "Radiohead"}),
+            ("Play electronic music", {"action": "play", "query": "electronic"}),
             ("Skip", {"action": "skip"}),
             ("Skip this song", {"action": "skip"}),
             ("Next song", {"action": "skip"}),
@@ -306,10 +342,6 @@ class PandoraCommand(IJarvisCommand):
             ("What are my stations", {"action": "stations"}),
             ("List my Pandora stations", {"action": "stations"}),
             ("Show my stations", {"action": "stations"}),
-            ("Create a Beatles station", {"action": "create_station", "query": "Beatles"}),
-            ("Make a station for Taylor Swift", {"action": "create_station", "query": "Taylor Swift"}),
-            ("Start a new station for electronic music", {"action": "create_station", "query": "electronic music"}),
-            ("Create a station based on Bohemian Rhapsody", {"action": "create_station", "query": "Bohemian Rhapsody"}),
         ]
         return [
             CommandExample(
@@ -353,7 +385,6 @@ class PandoraCommand(IJarvisCommand):
             "thumbs_up": self._handle_thumbs_up,
             "thumbs_down": self._handle_thumbs_down,
             "stations": self._handle_stations,
-            "create_station": self._handle_create_station,
             "now_playing": self._handle_now_playing,
         }.get(action)
 
@@ -366,28 +397,61 @@ class PandoraCommand(IJarvisCommand):
         return handler(service, query)
 
     def _handle_play(self, service: Any, query: str | None) -> CommandResponse:
+        """Play a station, creating it from a search if no existing match.
+
+        Resolution order:
+          1. No query → resume current station / first station
+          2. Query matches an existing station (exact or substring) → play it
+          3. Query matches an artist/song via Pandora search → create + play
+          4. No match anywhere → error
+        """
         try:
-            track = service.play_station(station_name=query)
-            return CommandResponse.success_response(
-                context_data={
-                    "action": "play",
-                    "message": (
-                        f"Now playing {track['song']} by {track['artist']} "
-                        f"on your {track['station']} station"
-                    ),
-                    **track,
-                },
-            )
+            # Case 1: no query
+            if not query:
+                track = service.play_station(station_name=None)
+                return self._play_response(track, created=False)
+
+            # Case 2: query matches an existing station
+            existing = service.find_station(query)
+            if existing is not None:
+                track = service.play_station(station_name=query)
+                return self._play_response(track, created=False)
+
+            # Case 3: fall through to search + create
+            logger.info("No existing Pandora station matched, creating new", query=query)
+            created = service.search_and_create_station(query)
+            track = service.play_station(station_name=created["name"])
+            return self._play_response(track, created=True)
+
         except ValueError as e:
+            # search_and_create_station raises ValueError on no results
             return CommandResponse.error_response(
-                error_details=str(e),
-                context_data={"error": "station_not_found", "query": query or ""},
+                error_details=(
+                    f"I couldn't find a Pandora station or artist for '{query}'. "
+                    "Try a different name."
+                ),
+                context_data={"error": "no_results", "query": query or "", "detail": str(e)},
             )
         except RuntimeError as e:
             return CommandResponse.error_response(
                 error_details=str(e),
                 context_data={"error": "playback_error"},
             )
+
+    @staticmethod
+    def _play_response(track: dict[str, str], *, created: bool) -> CommandResponse:
+        prefix = "Created and now playing" if created else "Now playing"
+        return CommandResponse.success_response(
+            context_data={
+                "action": "play",
+                "created_station": created,
+                "message": (
+                    f"{prefix} {track['song']} by {track['artist']} "
+                    f"on your {track['station']} station"
+                ),
+                **track,
+            },
+        )
 
     def _handle_skip(self, service: Any, _query: str | None) -> CommandResponse:
         try:
@@ -459,30 +523,6 @@ class PandoraCommand(IJarvisCommand):
             },
         )
 
-    def _handle_create_station(
-        self, service: Any, query: str | None
-    ) -> CommandResponse:
-        if not query:
-            return CommandResponse.error_response(
-                error_details="What artist or song should I create a station from?",
-                context_data={"error": "missing_query"},
-            )
-        try:
-            result = service.search_and_create_station(query)
-            return CommandResponse.success_response(
-                context_data={
-                    "action": "create_station",
-                    "message": f"Created station '{result['name']}' based on {result['source']} match for '{query}'",
-                    "station_name": result["name"],
-                    "query": query,
-                },
-            )
-        except ValueError as e:
-            return CommandResponse.error_response(
-                error_details=str(e),
-                context_data={"error": "no_results", "query": query},
-            )
-
     def _handle_now_playing(
         self, service: Any, _query: str | None
     ) -> CommandResponse:
@@ -507,8 +547,8 @@ class PandoraCommand(IJarvisCommand):
 
     def init_data(self) -> dict[str, Any]:
         """Test Pandora connection during setup."""
-        email = self._storage.get_secret("PANDORA_EMAIL", scope="user")
-        password = self._storage.get_secret("PANDORA_PASSWORD", scope="user")
+        email = self._storage.get_secret("PANDORA_EMAIL", scope="integration")
+        password = self._storage.get_secret("PANDORA_PASSWORD", scope="integration")
 
         if not email or not password:
             return {"status": "error", "message": "Pandora credentials not set"}

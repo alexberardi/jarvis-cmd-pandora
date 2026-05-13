@@ -1,7 +1,7 @@
 name: "pandora"
 display_name: "Pandora Radio"
-description: "Stream Pandora radio stations with voice control. Play stations, skip tracks, thumbs up/down, and create new stations."
-version: "1.0.0"
+description: "Stream Pandora radio with voice control. Play any station, artist, song, or genre — skip, thumbs up/down, and list stations."
+version: "1.1.3"
 min_jarvis_version: "0.9.0"
 license: "MIT"
 author:
@@ -21,14 +21,14 @@ packages:
 
 secrets:
   - key: PANDORA_EMAIL
-    scope: user
+    scope: integration
     value_type: string
     description: "Pandora account email address"
     is_sensitive: false
     required: true
     friendly_name: "Pandora Email"
   - key: PANDORA_PASSWORD
-    scope: user
+    scope: integration
     value_type: string
     description: "Pandora account password"
     is_sensitive: true

@@ -1,8 +1,11 @@
 """Pandora streaming service wrapper around pydora."""
 
+import os
+import re
 import shutil
 import subprocess
 import threading
+import time
 from typing import Any
 
 try:
@@ -40,11 +43,44 @@ _PARTNER_SETTINGS: dict[str, str] = {
 
 
 def _find_player() -> str | None:
-    """Find an available audio player binary."""
-    for player in ("mpv", "vlc", "cvlc", "ffplay"):
+    """Find an available audio player binary.
+
+    Order matters: ffplay is preferred over vlc because vlc refuses to run
+    as root, and jarvis-node runs as root on Pi installs. mpv stays first
+    because it has the cleanest streaming behavior when available.
+    """
+    for player in ("mpv", "ffplay", "vlc", "cvlc"):
         if shutil.which(player):
             return player
     return None
+
+
+def _pulseaudio_accessible() -> bool:
+    """Check if PulseAudio is reachable from this process.
+
+    On Pi installs jarvis-node runs as root, but PulseAudio runs per-user
+    (as `pi`) — so root can't connect. SDL2-backed players (ffplay) default
+    to PulseAudio when libpulse is installed and silently fail to open audio
+    when it can't connect. We detect that case and force the player to use
+    ALSA directly instead.
+    """
+    if shutil.which("pactl") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["pactl", "info"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+# Minimum number of seconds a player must stay alive before we treat its exit
+# as "track ended naturally" rather than "playback failed immediately".
+# Below this threshold we stop the auto-advance loop to prevent runaway
+# Pandora API calls (which previously got the account rate-limited).
+_MIN_TRACK_DURATION_SECONDS: float = 3.0
 
 
 class PandoraService:
@@ -57,9 +93,11 @@ class PandoraService:
         self._playlist: Any = None
         self._current_track: Any = None
         self._player_process: subprocess.Popen | None = None
+        self._player_started_at: float = 0.0
         self._playback_thread: threading.Thread | None = None
         self._playing: bool = False
         self._player_bin: str | None = _find_player()
+        self._last_player_error: str | None = None
 
     @property
     def is_logged_in(self) -> bool:
@@ -87,19 +125,62 @@ class PandoraService:
         ]
 
     def find_station(self, query: str) -> Any | None:
-        """Find a station by name (fuzzy match)."""
+        """Find a station by name (fuzzy match).
+
+        Tries, in order:
+          1. exact match on normalized name
+          2. substring match on normalized name (either direction)
+          3. token-overlap match — at least 60% of query tokens appear in
+             the station name (handles "1990s summer hits" → "Summer Hits
+             of the 90s Radio" where the LLM normalized "the 90s" to "1990s")
+        """
         if not self._stations:
             self._stations = self._client.get_station_list()
-        query_lower = query.lower()
-        # Exact match first
+
+        query_norm = self._normalize_for_match(query)
+        if not query_norm:
+            return None
+
+        # 1. Exact match
         for station in self._stations:
-            if station.name.lower() == query_lower:
+            if self._normalize_for_match(station.name) == query_norm:
                 return station
-        # Substring match
+
+        # 2. Substring (either direction)
         for station in self._stations:
-            if query_lower in station.name.lower():
+            station_norm = self._normalize_for_match(station.name)
+            if query_norm in station_norm or station_norm in query_norm:
                 return station
-        return None
+
+        # 3. Token-overlap fallback
+        query_tokens = set(query_norm.split())
+        if not query_tokens:
+            return None
+        best: tuple[float, Any] | None = None
+        for station in self._stations:
+            station_tokens = set(self._normalize_for_match(station.name).split())
+            if not station_tokens:
+                continue
+            overlap = len(query_tokens & station_tokens) / len(query_tokens)
+            if overlap >= 0.6 and (best is None or overlap > best[0]):
+                best = (overlap, station)
+        return best[1] if best else None
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Normalize a station name or query for fuzzy matching.
+
+        Lowercases, strips Pandora-specific suffixes ("Radio", "Station"),
+        and folds decade phrasings so "1990s" / "90's" / "90s" all compare equal.
+        """
+        s = text.lower().strip()
+        s = re.sub(r"\b19(\d0)s\b", r"\1s", s)   # 1990s -> 90s, 1980s -> 80s
+        s = re.sub(r"\b20(\d0)s\b", r"\1s", s)   # 2000s -> 00s, etc.
+        s = re.sub(r"\b(\d0)'s\b", r"\1s", s)    # 90's -> 90s
+        s = re.sub(r"\b(?:radio|station)\b", "", s)
+        s = re.sub(r"[^\w\s]", " ", s)            # drop punctuation
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
     def play_station(self, station_name: str | None = None) -> dict[str, str]:
         """Start playing a station. Returns current track info."""
@@ -147,22 +228,57 @@ class PandoraService:
         return self._track_info(track)
 
     def _start_player(self, audio_url: str) -> None:
-        """Start audio player subprocess and background monitor thread."""
+        """Start audio player subprocess and background monitor thread.
+
+        Routes audio to Bluetooth speaker if one is connected, otherwise
+        plays on the local (default) speaker. stderr is captured so that
+        immediate-failure diagnostics survive into _monitor_playback.
+        """
         self._kill_player()
 
         cmd: list[str] = []
-        if self._player_bin in ("mpv",):
+        if self._player_bin == "mpv":
             cmd = ["mpv", "--no-video", "--really-quiet", audio_url]
+        elif self._player_bin == "ffplay":
+            # -loglevel error keeps fatal errors visible while staying quiet
+            cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", audio_url]
         elif self._player_bin in ("vlc", "cvlc"):
             cmd = ["cvlc", "--play-and-exit", "--no-video", "-q", audio_url]
-        elif self._player_bin == "ffplay":
-            cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", audio_url]
+
+        # Route to Bluetooth speaker if available, otherwise local speaker
+        try:
+            from jarvis_command_sdk import BluetoothAudio
+            env = BluetoothAudio.playback_env()
+        except ImportError:
+            env = None
+
+        # If PulseAudio isn't reachable from this process (e.g. jarvis-node
+        # running as root while PulseAudio is per-user), force SDL/ALSA-backed
+        # players to bypass PulseAudio entirely.
+        #
+        # Two env vars are needed together:
+        #   SDL_AUDIODRIVER=alsa — tells SDL to use ALSA, not PulseAudio
+        #   AUDIODEV=output     — tells ALSA to open the named "output" PCM
+        #                          (defined in jarvis-node-setup's asound.conf
+        #                          as softvol → HifiBerry / card 0)
+        # Setting only SDL_AUDIODRIVER is NOT enough — SDL still opens ALSA's
+        # "default" device, which goes through the pulse plugin and fails
+        # with "Couldn't open audio device: Connection refused".
+        # User-set env vars take precedence (setdefault), so non-Pi systems
+        # can override.
+        if not _pulseaudio_accessible():
+            env = dict(env) if env else dict(os.environ)
+            env.setdefault("SDL_AUDIODRIVER", "alsa")
+            env.setdefault("AUDIODEV", "output")
 
         self._player_process = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
         )
+        self._player_started_at = time.monotonic()
         self._playing = True
 
         self._playback_thread = threading.Thread(
@@ -176,10 +292,40 @@ class PandoraService:
         )
 
     def _monitor_playback(self) -> None:
-        """Wait for current track to end, then auto-advance."""
-        if self._player_process is None:
+        """Wait for current track to end, then auto-advance.
+
+        Guards against a runaway loop: if the player exits faster than
+        _MIN_TRACK_DURATION_SECONDS we treat it as a failure (stderr captured),
+        log the failure, and stop the loop. Without this guard a silently-
+        failing player (e.g. vlc-as-root) hammers the Pandora API and
+        gets the account rate-limited.
+        """
+        proc = self._player_process
+        if proc is None:
             return
-        self._player_process.wait()
+
+        proc.wait()
+        duration = time.monotonic() - self._player_started_at
+        rc = proc.returncode
+        stderr_text = ""
+        if proc.stderr is not None:
+            try:
+                stderr_text = proc.stderr.read() or ""
+            except Exception:
+                pass
+
+        if duration < _MIN_TRACK_DURATION_SECONDS:
+            self._last_player_error = stderr_text.strip()[:500] or f"player exited with rc={rc}"
+            logger.error(
+                "Audio player exited too quickly — aborting playback to prevent loop",
+                player=self._player_bin,
+                return_code=rc,
+                duration_seconds=round(duration, 2),
+                stderr=self._last_player_error,
+            )
+            self._playing = False
+            return
+
         if self._playing:
             try:
                 self._play_next()

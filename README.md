@@ -4,11 +4,10 @@ Pandora radio voice command for [Jarvis](https://github.com/alexberardi/jarvis).
 
 ## Features
 
-- **Play stations** — "Play my jazz station on Pandora"
+- **Play anything** — "Play my jazz station", "Put on Tom Petty", "Play summer hits of the 90s radio". Matches an existing station by name, or creates a new one from the artist/song/genre when no match is found.
 - **Skip tracks** — "Skip this song" / "Next"
 - **Thumbs up/down** — "I like this song" / "Thumbs down"
 - **List stations** — "What are my Pandora stations?"
-- **Create stations** — "Create a Beatles station"
 - **Now playing** — "What song is this?"
 
 ## Requirements
