@@ -195,13 +195,30 @@ class PandoraCommand(IJarvisCommand):
     def pre_route(self, voice_command: str) -> PreRouteResult | None:
         text = voice_command.lower().strip().rstrip(".!?")
 
-        simple_map: dict[str, dict[str, str]] = {
+        # Explicit phrases — always claim them, even when Pandora isn't
+        # the active player. "stop pandora" should stop Pandora no matter
+        # what else is playing.
+        explicit_map: dict[str, dict[str, str]] = {
+            "stop pandora": {"action": "stop"},
+            "play pandora": {"action": "play"},
+            "my stations": {"action": "stations"},
+            "list stations": {"action": "stations"},
+        }
+        if text in explicit_map:
+            return PreRouteResult(arguments=explicit_map[text])
+
+        # Ambiguous phrases — "stop", "skip", "next", "thumbs up", etc.
+        # could mean Pandora OR Spotify (or another music service). Only
+        # claim them when Pandora is the currently-active player.
+        # Otherwise return None so the next command's pre_route (or the
+        # LLM) can handle. This prevents Pandora from swallowing a "stop"
+        # when Spotify is actually playing.
+        ambiguous_map: dict[str, dict[str, str]] = {
             "skip": {"action": "skip"},
             "next": {"action": "skip"},
             "next song": {"action": "skip"},
             "skip song": {"action": "skip"},
             "stop": {"action": "stop"},
-            "stop pandora": {"action": "stop"},
             "thumbs up": {"action": "thumbs_up"},
             "thumbs down": {"action": "thumbs_down"},
             "like this song": {"action": "thumbs_up"},
@@ -210,13 +227,11 @@ class PandoraCommand(IJarvisCommand):
             "what's playing": {"action": "now_playing"},
             "what song is this": {"action": "now_playing"},
             "now playing": {"action": "now_playing"},
-            "my stations": {"action": "stations"},
-            "list stations": {"action": "stations"},
-            "play pandora": {"action": "play"},
         }
-
-        if text in simple_map:
-            return PreRouteResult(arguments=simple_map[text])
+        if text in ambiguous_map:
+            if _cached_service is not None and _cached_service.is_playing:
+                return PreRouteResult(arguments=ambiguous_map[text])
+            return None
 
         # "play X", "play my X", "play X station", "play X radio",
         # "play X on Pandora", "put on X", "listen to X", "start X" — extract X.

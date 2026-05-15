@@ -76,30 +76,6 @@ def _pulseaudio_accessible() -> bool:
         return False
 
 
-def _pulseaudio_has_real_output() -> bool:
-    """Check if PA's default sink is a real audio output (not auto_null/Dummy).
-
-    WirePlumber inserts a placeholder ``auto_null`` (a.k.a. "Dummy Output")
-    sink when no real ALSA cards are detected. Routing a player to that
-    sink looks fine to the player but produces no audible sound. We treat
-    that case the same as "PulseAudio unreachable" — fall back to ALSA
-    directly so the local speaker hears something.
-    """
-    if shutil.which("pactl") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["pactl", "get-default-sink"],
-            capture_output=True, text=True, timeout=2.0,
-        )
-        if result.returncode != 0:
-            return False
-        sink = result.stdout.strip().lower()
-        return bool(sink) and "auto_null" not in sink and "dummy" not in sink
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
 # Minimum number of seconds a player must stay alive before we treat its exit
 # as "track ended naturally" rather than "playback failed immediately".
 # Below this threshold we stop the auto-advance loop to prevent runaway
@@ -269,14 +245,17 @@ class PandoraService:
         except ImportError:
             pass
 
-        # Use ALSA-direct when there's no BT and either (a) PA is
-        # unreachable or (b) PA's default sink is the placeholder
-        # auto_null/Dummy that WirePlumber inserts when no cards are
-        # detected. Without (b), the player happily streams into the
-        # null sink and produces silence.
-        use_alsa_direct = bt_sink is None and (
-            not _pulseaudio_accessible() or not _pulseaudio_has_real_output()
-        )
+        # Use ALSA-direct whenever no BT sink is connected. The PA default
+        # on jarvis nodes is unreliable: WirePlumber may pick HDMI or the
+        # SoC platform-sound card (neither of which has a speaker the user
+        # can hear) as the default. Routing through ALSA's "output" alias
+        # (defined in jarvis-node-setup's /etc/asound.conf as
+        # softvol → seeed2micvoicec) is the deterministic source of truth
+        # for the local speaker. PA is still used for BT routing because
+        # the bluez backend exposes BT sinks through PipeWire's pulse
+        # compat layer — that path is the supported way to reach a BT
+        # speaker on this stack.
+        use_alsa_direct = bt_sink is None
 
         cmd: list[str] = []
         if self._player_bin == "mpv":
@@ -335,12 +314,34 @@ class PandoraService:
         log the failure, and stop the loop. Without this guard a silently-
         failing player (e.g. vlc-as-root) hammers the Pandora API and
         gets the account rate-limited.
+
+        Also guards against a *stale-monitor* race: every _start_player
+        spawns a fresh monitor thread but doesn't kill the previous one.
+        If a previous monitor was still waiting on its (now-orphan) mpv
+        when stop() ran, it would wake up later, see _playing == True
+        (because a fresh play happened in between), and auto-advance —
+        spawning yet another mpv and resurrecting playback minutes after
+        the user thought they'd stopped it. The `proc is self._player_process`
+        check ensures only the monitor for the *current* player can
+        auto-advance; obsolete monitors return silently.
         """
         proc = self._player_process
         if proc is None:
             return
 
         proc.wait()
+
+        # Stale-monitor guard. If _player_process was replaced (new play)
+        # or cleared (stop/kill), this monitor is for an old mpv that no
+        # longer represents the user's intent. Return without advancing.
+        if self._player_process is not proc:
+            return
+        # Explicit-stop guard. _playing is set False by stop() / skip()-
+        # to-empty / fatal errors. Even when the proc identity matches,
+        # honor the flag.
+        if not self._playing:
+            return
+
         duration = time.monotonic() - self._player_started_at
         rc = proc.returncode
         stderr_text = ""
@@ -362,12 +363,11 @@ class PandoraService:
             self._playing = False
             return
 
-        if self._playing:
-            try:
-                self._play_next()
-            except Exception as e:
-                logger.error("Auto-advance failed", error=str(e))
-                self._playing = False
+        try:
+            self._play_next()
+        except Exception as e:
+            logger.error("Auto-advance failed", error=str(e))
+            self._playing = False
 
     def _kill_player(self) -> None:
         """Kill the current audio player subprocess."""
