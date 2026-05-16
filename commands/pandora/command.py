@@ -233,6 +233,13 @@ class PandoraCommand(IJarvisCommand):
                 return PreRouteResult(arguments=ambiguous_map[text])
             return None
 
+        # If the user explicitly named a different music service, don't
+        # pre-route — let that service's pre_route (or the LLM) handle it.
+        # Without this, "play X on spotify" would match the catch-all regex
+        # below with query="X on spotify" and play it as a Pandora station.
+        if re.search(r"\bon\s+(spotify|apple\s+music|youtube|amazon\s+music|tidal|soundcloud)\b", text):
+            return None
+
         # "play X", "play my X", "play X station", "play X radio",
         # "play X on Pandora", "put on X", "listen to X", "start X" — extract X.
         # Trailing "station|radio" and "on pandora" are phrasing, not part of the name.
