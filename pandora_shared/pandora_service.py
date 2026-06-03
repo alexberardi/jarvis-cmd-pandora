@@ -184,6 +184,20 @@ class PandoraService:
 
     def play_station(self, station_name: str | None = None) -> dict[str, str]:
         """Start playing a station. Returns current track info."""
+        info = self.prepare_station(station_name)
+        self.start_current_track()
+        return info
+
+    def prepare_station(self, station_name: str | None = None) -> dict[str, str]:
+        """Resolve the station and the first non-ad track WITHOUT starting playback.
+
+        Split from ``play_station`` so callers (the voice command) can compose
+        their spoken response from the track info and defer the actual audio
+        playback until the wake-word duck has been released — see the
+        on_response_complete hook on ``CommandResponse``. Without this split,
+        mpv starts streaming immediately and the first few seconds of audio
+        are swallowed by the duck null sink.
+        """
         if not self._player_bin:
             raise RuntimeError(
                 "No audio player found. Install mpv, vlc, or ffplay."
@@ -195,7 +209,6 @@ class PandoraService:
                 raise ValueError(f"Station '{station_name}' not found")
             self._current_station = station
         elif self._current_station is None:
-            # Default to first station
             stations = self.list_stations()
             if not stations:
                 raise ValueError("No stations found on your account")
@@ -205,12 +218,23 @@ class PandoraService:
         self._playlist = iter(
             self._client.get_playlist(self._current_station.token)
         )
-        return self._play_next()
+        return self._advance_to_next_non_ad()
 
-    def _play_next(self) -> dict[str, str]:
-        """Advance to the next track and start playback."""
+    def start_current_track(self) -> None:
+        """Start the audio player for the track set by ``prepare_station``.
+
+        No-op if there is no current track (caller didn't prepare first).
+        """
+        if self._current_track is None:
+            return
+        self._start_player(self._current_track.audio_url)
+
+    def _advance_to_next_non_ad(self) -> dict[str, str]:
+        """Advance ``self._current_track`` to the next non-ad track WITHOUT
+        starting playback. Refetches the playlist when exhausted. Raises
+        ``RuntimeError`` if no track is available after a refetch.
+        """
         track = next(self._playlist, None)
-        # Playlist exhausted, fetch a new batch
         if track is None:
             self._playlist = iter(
                 self._client.get_playlist(self._current_station.token)
@@ -219,13 +243,25 @@ class PandoraService:
             if track is None:
                 raise RuntimeError("No tracks available for this station")
 
-        # Skip ads
         if getattr(track, "is_ad", False):
-            return self._play_next()
+            return self._advance_to_next_non_ad()
 
         self._current_track = track
-        self._start_player(track.audio_url)
         return self._track_info(track)
+
+    def _play_next(self) -> dict[str, str]:
+        """Advance to the next track and start playback.
+
+        Used by the playback monitor when the current track finishes —
+        skip/next from the voice command path should go through
+        ``prepare_station`` + ``start_current_track`` instead, so the new
+        track's audio doesn't start before the spoken "Skipped to X" has
+        finished playing.
+        """
+        info = self._advance_to_next_non_ad()
+        if self._current_track is not None:
+            self._start_player(self._current_track.audio_url)
+        return info
 
     def _start_player(self, audio_url: str) -> None:
         """Start audio player subprocess and background monitor thread.
@@ -385,6 +421,18 @@ class PandoraService:
             raise RuntimeError("Nothing is playing")
         return self._play_next()
 
+    def prepare_skip(self) -> dict[str, str]:
+        """Advance to the next non-ad track WITHOUT starting playback.
+
+        Pairs with ``start_current_track`` to defer the actual mpv launch
+        until after the spoken response — mirrors ``prepare_station`` for
+        the skip / thumbs-down path.
+        """
+        if not self._current_station:
+            raise RuntimeError("Nothing is playing")
+        self.stop()
+        return self._advance_to_next_non_ad()
+
     def stop(self) -> None:
         """Stop playback."""
         self._playing = False
@@ -405,6 +453,16 @@ class PandoraService:
 
     def thumbs_down(self) -> dict[str, str]:
         """Thumbs down the current track and skip to next."""
+        self.rate_current_track_down()
+        return self.skip()
+
+    def rate_current_track_down(self) -> None:
+        """Send a thumbs-down for the current track WITHOUT advancing.
+
+        Pairs with ``prepare_skip`` + ``start_current_track`` so the voice
+        handler can defer the new-track audio until after the spoken
+        response. Raises ``RuntimeError`` if nothing is playing.
+        """
         if not self._current_track:
             raise RuntimeError("No track is currently playing")
         self._current_track.thumbs_down()
@@ -413,7 +471,6 @@ class PandoraService:
             song=self._current_track.song_name,
             artist=self._current_track.artist_name,
         )
-        return self.skip()
 
     def now_playing(self) -> dict[str, str] | None:
         """Return info about the current track."""

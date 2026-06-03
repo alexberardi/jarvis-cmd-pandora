@@ -426,24 +426,28 @@ class PandoraCommand(IJarvisCommand):
           2. Query matches an existing station (exact or substring) → play it
           3. Query matches an artist/song via Pandora search → create + play
           4. No match anywhere → error
+
+        The actual mpv launch is deferred to on_response_complete so the
+        first seconds of audio aren't dumped into the wake-word duck null
+        sink — see jarvis-command-sdk CommandResponse.
         """
         try:
             # Case 1: no query
             if not query:
-                track = service.play_station(station_name=None)
-                return self._play_response(track, created=False)
+                track = service.prepare_station(station_name=None)
+                return self._play_response(track, service, created=False)
 
             # Case 2: query matches an existing station
             existing = service.find_station(query)
             if existing is not None:
-                track = service.play_station(station_name=query)
-                return self._play_response(track, created=False)
+                track = service.prepare_station(station_name=query)
+                return self._play_response(track, service, created=False)
 
             # Case 3: fall through to search + create
             logger.info("No existing Pandora station matched, creating new", query=query)
             created = service.search_and_create_station(query)
-            track = service.play_station(station_name=created["name"])
-            return self._play_response(track, created=True)
+            track = service.prepare_station(station_name=created["name"])
+            return self._play_response(track, service, created=True)
 
         except ValueError as e:
             # search_and_create_station raises ValueError on no results
@@ -461,8 +465,17 @@ class PandoraCommand(IJarvisCommand):
             )
 
     @staticmethod
-    def _play_response(track: dict[str, str], *, created: bool) -> CommandResponse:
+    def _play_response(
+        track: dict[str, str], service: Any, *, created: bool,
+    ) -> CommandResponse:
         prefix = "Created and now playing" if created else "Now playing"
+
+        def _start_playback() -> None:
+            try:
+                service.start_current_track()
+            except Exception as e:
+                logger.error("Deferred Pandora playback start failed", error=str(e))
+
         return CommandResponse.success_response(
             context_data={
                 "action": "play",
@@ -473,17 +486,26 @@ class PandoraCommand(IJarvisCommand):
                 ),
                 **track,
             },
+            on_response_complete=_start_playback,
         )
 
     def _handle_skip(self, service: Any, _query: str | None) -> CommandResponse:
         try:
-            track = service.skip()
+            track = service.prepare_skip()
+
+            def _start_playback() -> None:
+                try:
+                    service.start_current_track()
+                except Exception as e:
+                    logger.error("Deferred Pandora skip playback failed", error=str(e))
+
             return CommandResponse.success_response(
                 context_data={
                     "action": "skip",
                     "message": f"Skipped to {track['song']} by {track['artist']}",
                     **track,
                 },
+                on_response_complete=_start_playback,
             )
         except RuntimeError as e:
             return CommandResponse.error_response(
@@ -515,13 +537,26 @@ class PandoraCommand(IJarvisCommand):
 
     def _handle_thumbs_down(self, service: Any, _query: str | None) -> CommandResponse:
         try:
-            track = service.thumbs_down()
+            # Rate the current track first, then prepare the next one without
+            # starting playback — actual mpv launch happens in the deferred
+            # callback after TTS, so the user hears the spoken response cleanly
+            # rather than the new track stomping on it.
+            service.rate_current_track_down()
+            track = service.prepare_skip()
+
+            def _start_playback() -> None:
+                try:
+                    service.start_current_track()
+                except Exception as e:
+                    logger.error("Deferred Pandora thumbs-down playback failed", error=str(e))
+
             return CommandResponse.success_response(
                 context_data={
                     "action": "thumbs_down",
                     "message": f"Disliked that track. Now playing {track['song']} by {track['artist']}",
                     **track,
                 },
+                on_response_complete=_start_playback,
             )
         except RuntimeError as e:
             return CommandResponse.error_response(

@@ -1,7 +1,7 @@
 name: "pandora"
 display_name: "Pandora Radio"
 description: "Stream Pandora radio with voice control. Play any station, artist, song, or genre — skip, thumbs up/down, and list stations."
-version: "1.1.3"
+version: "1.2.0"
 min_jarvis_version: "0.9.0"
 license: "MIT"
 author:
