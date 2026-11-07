@@ -10,6 +10,14 @@ Pandora radio voice command for [Jarvis](https://github.com/alexberardi/jarvis).
 - **List stations** — "What are my Pandora stations?"
 - **Now playing** — "What song is this?"
 
+### Now playing on the display and in the app
+
+`PandoraCommand` is an `IJarvisMusicCommand` (SDK 0.16+). The node shows the
+current track, station, cover, position and volume on the display and in the
+mobile app, with pause, play, skip, thumbs up and volume. Pause, volume and
+position need mpv (they go over its control socket); with ffplay or VLC the
+app offers skip and thumbs up only. On an older SDK it stays a plain command.
+
 ## Requirements
 
 - A Pandora account (free or premium)
