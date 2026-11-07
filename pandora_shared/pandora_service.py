@@ -1,9 +1,12 @@
 """Pandora streaming service wrapper around pydora."""
 
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
@@ -98,6 +101,9 @@ class PandoraService:
         self._playing: bool = False
         self._player_bin: str | None = _find_player()
         self._last_player_error: str | None = None
+        self._paused: bool = False  # only pause() pauses mpv
+        # mpv's JSON IPC socket: pause, volume and position (other players have none).
+        self._ipc_path: str = os.path.join(tempfile.gettempdir(), f"jarvis-pandora-{os.getpid()}.sock")
 
     @property
     def is_logged_in(self) -> bool:
@@ -295,11 +301,12 @@ class PandoraService:
 
         cmd: list[str] = []
         if self._player_bin == "mpv":
+            ipc = f"--input-ipc-server={self._ipc_path}"
             if use_alsa_direct:
-                cmd = ["mpv", "--no-video", "--really-quiet",
+                cmd = ["mpv", "--no-video", "--really-quiet", ipc,
                        "--ao=alsa", "--audio-device=alsa/output", audio_url]
             else:
-                cmd = ["mpv", "--no-video", "--really-quiet", audio_url]
+                cmd = ["mpv", "--no-video", "--really-quiet", ipc, audio_url]
         elif self._player_bin == "ffplay":
             # -loglevel error keeps fatal errors visible while staying quiet
             cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", audio_url]
@@ -331,6 +338,7 @@ class PandoraService:
         )
         self._player_started_at = time.monotonic()
         self._playing = True
+        self._paused = False
 
         self._playback_thread = threading.Thread(
             target=self._monitor_playback, daemon=True
@@ -436,6 +444,7 @@ class PandoraService:
     def stop(self) -> None:
         """Stop playback."""
         self._playing = False
+        self._paused = False
         self._kill_player()
         self._current_track = None
 
@@ -444,6 +453,7 @@ class PandoraService:
         if not self._current_track:
             raise RuntimeError("No track is currently playing")
         self._current_track.thumbs_up()
+        self._current_track.song_rating = 1  # what Pandora now has; the track object doesn't refresh
         logger.info(
             "Thumbs up",
             song=self._current_track.song_name,
@@ -477,6 +487,70 @@ class PandoraService:
         if not self._current_track:
             return None
         return self._track_info(self._current_track)
+
+    # -- Now playing (the node's display and the mobile app) --
+
+    @property
+    def controllable(self) -> bool:
+        """True when the player has a control socket (mpv): pause, volume, position."""
+        return self._player_bin == "mpv"
+
+    def playback(self) -> dict[str, Any] | None:
+        """The current track and the player's state, read now; None when nothing plays."""
+        track = self._current_track
+        if not self.is_playing or track is None:
+            return None
+        info: dict[str, Any] = {
+            **self._track_info(track),
+            "paused": self._paused,
+            "liked": track.song_rating == 1,
+            "duration": float(track.track_length) if track.track_length else None,
+            "position": None,
+            "volume": None,
+            "art_url": track.album_art_url or "",
+        }
+        if self.controllable:
+            # mpv doesn't answer while the node holds it stopped (ducked for a voice turn).
+            try:
+                info["position"] = self._mpv("get_property", "time-pos")
+                info["volume"] = round(self._mpv("get_property", "volume"))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+        return info
+
+    def pause(self, paused: bool) -> None:
+        if not self.is_playing:
+            raise RuntimeError("Nothing is playing")
+        self._mpv("set_property", "pause", paused)
+        self._paused = paused
+
+    def set_volume(self, volume: int) -> None:
+        if not self.is_playing:
+            raise RuntimeError("Nothing is playing")
+        self._mpv("set_property", "volume", max(0, min(100, volume)))
+
+    def _mpv(self, *command: Any) -> Any:
+        """One mpv IPC command; returns its data. Raises RuntimeError on an mpv error."""
+        if not self.controllable:
+            raise RuntimeError(f"{self._player_bin} has no control socket")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(self._ipc_path)
+            sock.sendall(json.dumps({"command": list(command), "request_id": 1}).encode() + b"\n")
+            buf = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("mpv closed the control socket")
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                for line in lines:
+                    msg = json.loads(line)
+                    if msg.get("request_id") != 1:
+                        continue  # an event
+                    if msg.get("error") != "success":
+                        raise RuntimeError(f"mpv: {msg.get('error')}")
+                    return msg.get("data")
 
     def search_and_create_station(self, query: str) -> dict[str, str]:
         """Search for an artist/song and create a station from it."""

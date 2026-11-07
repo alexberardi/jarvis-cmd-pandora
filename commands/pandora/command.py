@@ -38,6 +38,13 @@ from jarvis_command_sdk import (
     RequestInformation,
 )
 
+try:
+    from jarvis_command_sdk import IJarvisMusicCommand, PlaybackArtwork, PlaybackState
+except ImportError:  # SDK < 0.16: a plain command; nothing asks it for playback
+    class IJarvisMusicCommand(IJarvisCommand):  # type: ignore[no-redef]
+        def report(self, state: Any = None) -> bool:
+            return False
+
 logger = JarvisLogger(service="jarvis-node")
 
 
@@ -47,11 +54,73 @@ logger = JarvisLogger(service="jarvis-node")
 _cached_service: Any = None
 
 
-class PandoraCommand(IJarvisCommand):
+class PandoraCommand(IJarvisMusicCommand):
     """Stream Pandora radio stations with voice control."""
 
     def __init__(self) -> None:
         self._storage = JarvisStorage("pandora")
+        self._cover: tuple[str, Any] | None = None  # (url, PlaybackArtwork): the current track's
+
+    # -- Playback (IJarvisMusicCommand) --
+    # The node's display, the mobile app and the built-in "pause the music" commands read and
+    # control the player through these. They never log in: with no session, nothing plays.
+
+    @property
+    def playback_binary(self) -> str:
+        from pandora_shared.pandora_service import _find_player
+
+        return _find_player() or "mpv"
+
+    def playback_status(self) -> Any:
+        service = _cached_service
+        now = service.playback() if service is not None else None
+        if now is None:
+            return None
+        # Pandora has no previous, seek, shuffle or repeat.
+        actions = ("play", "pause", "next", "like", "volume") if service.controllable else ("next", "like")
+        return PlaybackState(
+            state="paused" if now["paused"] else "playing",
+            media_title=now["song"],
+            media_artist=now["artist"],
+            media_album=now["album"],
+            context=now["station"],
+            position=now["position"],
+            duration=now["duration"],
+            volume=now["volume"],
+            liked=now["liked"],
+            actions=actions,
+        )
+
+    def playback_control(self, action: str, **args: Any) -> Any:
+        service = _cached_service
+        if service is None or not service.is_playing:
+            raise RuntimeError("Nothing is playing on Pandora")
+        if action in ("play", "pause"):
+            service.pause(action == "pause")
+        elif action == "next":
+            service.skip()
+        elif action == "like":
+            service.thumbs_up()  # Pandora has no "un-like" short of a thumbs down
+        elif action == "volume":
+            service.set_volume(int(args["volume"]))
+        else:
+            raise ValueError(f"pandora does not support {action!r}")
+        return self.playback_status()
+
+    def playback_artwork(self) -> Any:
+        import requests
+
+        now = _cached_service.playback() if _cached_service is not None else None
+        url = now["art_url"] if now else ""
+        if not url.startswith("https://"):
+            return None
+        if self._cover and self._cover[0] == url:
+            return self._cover[1]
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        art = PlaybackArtwork(data=resp.content, mime=resp.headers.get("content-type", "").split(";")[0].strip())
+        self._cover = (url, art)
+        return art
 
     def _get_service(self) -> Any:
         """Get or create an authenticated PandoraService (cached at module level)."""
@@ -464,15 +533,15 @@ class PandoraCommand(IJarvisCommand):
                 context_data={"error": "playback_error"},
             )
 
-    @staticmethod
     def _play_response(
-        track: dict[str, str], service: Any, *, created: bool,
+        self, track: dict[str, str], service: Any, *, created: bool,
     ) -> CommandResponse:
         prefix = "Created and now playing" if created else "Now playing"
 
         def _start_playback() -> None:
             try:
                 service.start_current_track()
+                self.report()
             except Exception as e:
                 logger.error("Deferred Pandora playback start failed", error=str(e))
 
@@ -496,6 +565,7 @@ class PandoraCommand(IJarvisCommand):
             def _start_playback() -> None:
                 try:
                     service.start_current_track()
+                    self.report()
                 except Exception as e:
                     logger.error("Deferred Pandora skip playback failed", error=str(e))
 
@@ -515,6 +585,7 @@ class PandoraCommand(IJarvisCommand):
 
     def _handle_stop(self, service: Any, _query: str | None) -> CommandResponse:
         service.stop()
+        self.report()
         return CommandResponse.success_response(
             context_data={"action": "stop", "message": "Pandora stopped"},
         )
@@ -547,6 +618,7 @@ class PandoraCommand(IJarvisCommand):
             def _start_playback() -> None:
                 try:
                     service.start_current_track()
+                    self.report()
                 except Exception as e:
                     logger.error("Deferred Pandora thumbs-down playback failed", error=str(e))
 
